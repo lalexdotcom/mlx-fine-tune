@@ -1,39 +1,50 @@
+# pipeline.py
+#
+# Main fine-tuning pipeline for MLX language models.
+# Orchestrates dataset download, chat template conversion, LoRA fine-tuning,
+# and adapter fusion. All paths are derived from --work-dir to avoid
+# hardcoded paths.
+
 import argparse
-import hashlib
 import json
 import re
 import shutil
 import subprocess
-import urllib.request
-import urllib.parse
 import yaml
 from pathlib import Path
 
-import pyarrow.parquet as pq
-from jinja2 import Environment, BaseLoader
+from lib.utils import short_hash, count_jsonl_lines
+from lib.dataset import (
+    download_parquet_files,
+    parquet_to_raw_jsonl,
+    raw_jsonl_path,
+    template_cache_dir,
+    template_cache_valid,
+    resolve_dataset_format,
+)
+from lib.model import resolve_model_path, read_tokenizer_config
+from formats.registry import load_format
 
-# ─── Paths are all derived from --work-dir, passed by mlx-fine-tune.sh ────────
+# ─── Paths derived from --work-dir ───────────────────────────────────────────
+# All None at import time, initialized by init_dirs() after parse_args()
 
-VENV_PYTHON    = None
-CACHE_DIR      = None
-WORK_DIR       = None
+VENV_PYTHON = None
+CACHE_DIR   = None
+WORK_DIR    = None
+
 
 def init_dirs(work_dir: str) -> None:
+    """Initialize global path variables from the work directory.
+    Called once at startup after parsing CLI arguments.
+    """
     global VENV_PYTHON, CACHE_DIR, WORK_DIR
     base        = Path(work_dir)
     VENV_PYTHON = base / "venv" / "bin" / "python3"
     CACHE_DIR   = base / "cache"
     WORK_DIR    = base / "work"
 
-# ─── Constants ────────────────────────────────────────────────────────────────
-
-LM_STUDIO_MODELS_DIR = (
-    Path.home() / ".lmstudio" / "models"
-    if (Path.home() / ".lmstudio" / "models").exists()
-    else Path.home() / ".cache" / "lm-studio" / "models"
-)
-
 # ─── Fine-tuning config ───────────────────────────────────────────────────────
+# All tunable parameters live here — override via CLI with apply_overrides()
 
 LORA_CONFIG = {
     "iters": 1000,
@@ -54,40 +65,30 @@ LORA_YAML_CONFIG = {
     }
 }
 
+# ─── Cache key helpers ────────────────────────────────────────────────────────
+
+def adapters_dir(model_name: str, dataset_hash: str, template_hash: str) -> Path:
+    """Return the directory for LoRA adapter checkpoints.
+    Keyed on model name + dataset hash + template hash to avoid mixing
+    adapters from different training runs.
+    """
+    return WORK_DIR / "adapters" / f"{model_name}_{dataset_hash}_{template_hash}"
+
+
+def data_dir(dataset_hash: str, template_hash: str) -> Path:
+    """Return the working data directory for a specific dataset + template combo.
+    This is a copy of the template cache used as mlx_lm training input.
+    """
+    return WORK_DIR / "data" / f"{dataset_hash}_{template_hash}"
+
 # ─── Utils ────────────────────────────────────────────────────────────────────
 
-def format_bytes(b: int) -> str:
-    if b < 1024 * 1024:
-        return f"{b / 1024:.1f} KB"
-    return f"{b / 1024 / 1024:.1f} MB"
-
-
-def count_jsonl_lines(path: Path) -> int:
-    if not path.exists():
-        return 0
-    count = 0
-    with open(path) as f:
-        for line in f:
-            if line.strip():
-                count += 1
-    return count
-
-
-def short_hash(value: str) -> str:
-    return hashlib.sha256(value.encode()).hexdigest()[:12]
-
-
-def get_token_string(token) -> str:
-    if token is None:
-        return ""
-    if isinstance(token, str):
-        return token
-    if isinstance(token, dict):
-        return token.get("content", "")
-    return ""
-
-
 def build_fused_path(model_path: Path, fused_base: str, name: str) -> Path:
+    """Derive the fused model output path by inserting --name before the
+    parameter count in the model directory name.
+    Example: Qwen3-4b-Instruct + name=Home → Qwen3-Home-4b-Instruct
+    Falls back to appending the name if no parameter count is found.
+    """
     dir_name = model_path.name
     match = re.search(r"(\d+\.?\d*[bBmM])", dir_name)
     if match:
@@ -99,40 +100,19 @@ def build_fused_path(model_path: Path, fused_base: str, name: str) -> Path:
         fused_name = f"{dir_name}-{name}"
     return Path(fused_base) / fused_name
 
-
-def hf_parquet_api(dataset_id: str) -> str:
-    return (
-        "https://datasets-server.huggingface.co/parquet"
-        f"?dataset={urllib.parse.quote(dataset_id, safe='')}"
-    )
-
-# ─── Cache key helpers ────────────────────────────────────────────────────────
-
-def parquet_cache_dir(dataset_hash: str) -> Path:
-    return CACHE_DIR / "parquet" / dataset_hash
-
-def raw_jsonl_path(dataset_hash: str) -> Path:
-    return CACHE_DIR / "raw" / dataset_hash / "rows.jsonl"
-
-def template_cache_dir(dataset_hash: str, template_hash: str) -> Path:
-    return CACHE_DIR / "template" / f"{dataset_hash}_{template_hash}"
-
-def adapters_dir(model_name: str, dataset_hash: str, template_hash: str) -> Path:
-    return WORK_DIR / "adapters" / f"{model_name}_{dataset_hash}_{template_hash}"
-
-def data_dir(dataset_hash: str, template_hash: str) -> Path:
-    return WORK_DIR / "data" / f"{dataset_hash}_{template_hash}"
-
 # ─── Args ─────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(description="MLX LLM fine-tuning pipeline")
     p.add_argument("--work-dir", required=True,
-                   help="Base working directory (set by mlx-fine-tune.sh)")
+                   help="Base working directory (set by run.sh)")
     p.add_argument("--dataset", "-d", required=True,
-                   help="HuggingFace dataset id (e.g. acon96/Home-Assistant-Requests-V2)")
+                   help="HuggingFace dataset ID (e.g. acon96/Home-Assistant-Requests-V2)")
+    p.add_argument("--dataset-format", default=None,
+                   help="Dataset format converter (e.g. acon96-v2). "
+                        "Auto-detected from cache if previously used with this dataset.")
     p.add_argument("--path", "-p", required=True,
-                   help="Model path (relative to LM Studio, absolute, ~/... or ./local)")
+                   help="Model path (relative to ~/.lmstudio/models/, absolute, ~/... or ./local)")
     p.add_argument("--name", type=str, default="tuned",
                    help="Name to insert in the fused model directory (default: tuned)")
     p.add_argument("--fused-base", default=".",
@@ -144,7 +124,7 @@ def parse_args():
     p.add_argument("--best-iter", type=int, default=None,
                    help="Checkpoint iter to use for fusion (default: auto-detected)")
     p.add_argument("--run-id", type=str, default="manual",
-                   help="Run ID for logging (injected by mlx-fine-tune.sh)")
+                   help="Run ID for logging (injected by run.sh)")
     p.add_argument("--iters", type=int, default=None,
                    help=f"Training iterations (default: {LORA_CONFIG['iters']})")
     p.add_argument("--batch-size", type=int, default=None,
@@ -164,7 +144,10 @@ def parse_args():
     return p.parse_args()
 
 
-def apply_overrides(args):
+def apply_overrides(args) -> None:
+    """Apply CLI overrides to the global LORA_CONFIG and LORA_YAML_CONFIG dicts.
+    Only overrides values that were explicitly passed on the command line.
+    """
     if args.iters is not None:
         LORA_CONFIG["iters"] = args.iters
     if args.batch_size is not None:
@@ -182,110 +165,18 @@ def apply_overrides(args):
     if args.patience is not None:
         LORA_CONFIG["patience"] = args.patience
 
-# ─── Model path resolution ────────────────────────────────────────────────────
+# ─── Dataset conversion ───────────────────────────────────────────────────────
 
-def resolve_model_path(input_path: str) -> Path:
-    p = input_path
-    if p.startswith("~/"):
-        p = str(Path.home() / p[2:])
-    path = Path(p)
-    if path.is_absolute():
-        return path
-    if p.startswith("./") or p.startswith("../"):
-        return Path.cwd() / path
-    return LM_STUDIO_MODELS_DIR / path
-
-# ─── Tokenizer ────────────────────────────────────────────────────────────────
-
-def read_tokenizer_config(model_path: Path) -> dict:
-    config_path = model_path / "tokenizer_config.json"
-    if not config_path.exists():
-        raise FileNotFoundError(f"tokenizer_config.json not found in: {model_path}")
-    with open(config_path) as f:
-        config = json.load(f)
-    if not config.get("chat_template"):
-        raise ValueError(f"No chat_template found in {config_path}")
-    print("✓ tokenizer_config.json loaded")
-    return config
-
-# ─── Parquet download ─────────────────────────────────────────────────────────
-
-def fetch_parquet_urls(dataset_id: str) -> list[dict]:
-    with urllib.request.urlopen(hf_parquet_api(dataset_id)) as r:
-        data = json.loads(r.read())
-    return [f for f in data["parquet_files"] if f["split"] == "train"]
-
-
-def download_file(url: str, dest: Path) -> None:
-    with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
-        while chunk := r.read(1024 * 1024):
-            f.write(chunk)
-
-
-def download_parquet_files(dataset_id: str, dataset_hash: str) -> list[Path]:
-    cache_dir = parquet_cache_dir(dataset_hash)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    print("Fetching parquet file list from HuggingFace...")
-    files = fetch_parquet_urls(dataset_id)
-    print(f"  {len(files)} parquet file(s) to download")
-
-    local_paths = []
-
-    for i, file in enumerate(files):
-        local_path = cache_dir / file["filename"]
-        local_paths.append(local_path)
-
-        if local_path.exists():
-            local_size = local_path.stat().st_size
-            if local_size == file["size"]:
-                print(f"  [{i+1}/{len(files)}] {file['filename']} — already cached ({format_bytes(file['size'])})")
-                continue
-            print(f"  [{i+1}/{len(files)}] {file['filename']} — incomplete ({format_bytes(local_size)}/{format_bytes(file['size'])}) — re-downloading")
-
-        print(f"  [{i+1}/{len(files)}] Downloading {file['filename']} ({format_bytes(file['size'])})...", end="", flush=True)
-        download_file(file["url"], local_path)
-        print(" ✓")
-
-    return local_paths
-
-# ─── Raw JSONL cache ──────────────────────────────────────────────────────────
-
-def count_parquet_rows(local_paths: list[Path]) -> int:
-    total = 0
-    for path in local_paths:
-        pf = pq.ParquetFile(path)
-        total += pf.metadata.num_rows
-    return total
-
-
-def raw_cache_valid(dataset_hash: str, local_paths: list[Path]) -> bool:
-    raw_path = raw_jsonl_path(dataset_hash)
-    if not raw_path.exists() or raw_path.stat().st_size == 0:
-        return False
-    parquet_total = count_parquet_rows(local_paths)
-    jsonl_lines = count_jsonl_lines(raw_path)
-    if jsonl_lines != parquet_total:
-        print(f"  ⚠ Raw JSONL incomplete ({jsonl_lines}/{parquet_total} rows) — re-converting")
-        return False
-    return True
-
-# ─── Template cache ───────────────────────────────────────────────────────────
-
-def template_cache_valid(dataset_hash: str, tmpl_hash: str) -> bool:
-    d = template_cache_dir(dataset_hash, tmpl_hash)
-    for split in ["train", "valid", "test"]:
-        path = d / f"{split}.jsonl"
-        if not path.exists() or path.stat().st_size == 0:
-            return False
-        if count_jsonl_lines(path) == 0:
-            return False
-    return True
-
-
-def copy_template_cache(dataset_hash: str, tmpl_hash: str, out_dir: Path) -> None:
+def copy_template_cache(
+    dataset_hash: str,
+    tmpl_hash: str,
+    out_dir: Path,
+) -> None:
+    """Copy the cached masked JSONL splits to the working data directory
+    used by mlx_lm as training input.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    src_dir = template_cache_dir(dataset_hash, tmpl_hash)
+    src_dir = template_cache_dir(CACHE_DIR, dataset_hash, tmpl_hash)
     for split in ["train", "valid", "test"]:
         src = src_dir / f"{split}.jsonl"
         dst = out_dir / f"{split}.jsonl"
@@ -293,115 +184,19 @@ def copy_template_cache(dataset_hash: str, tmpl_hash: str, out_dir: Path) -> Non
         lines = count_jsonl_lines(dst)
         print(f"  {dst} — {lines} examples (from cache)")
 
-# ─── Step 1: Parquet → raw JSONL ─────────────────────────────────────────────
-
-def parquet_to_raw_jsonl(dataset_hash: str, local_paths: list[Path]) -> None:
-    raw_path = raw_jsonl_path(dataset_hash)
-
-    if raw_cache_valid(dataset_hash, local_paths):
-        print(f"✓ Raw JSONL cache valid ({format_bytes(raw_path.stat().st_size)}) — skipping parquet conversion")
-        return
-
-    raw_path.parent.mkdir(parents=True, exist_ok=True)
-    total = count_parquet_rows(local_paths)
-    print(f"Converting parquet → raw JSONL...")
-    print(f"  {total} total rows across {len(local_paths)} file(s)")
-
-    written = 0
-    with open(raw_path, "w") as out:
-        for fi, path in enumerate(local_paths):
-            pf = pq.ParquetFile(path)
-            num_groups = pf.metadata.num_row_groups
-            print(f"  File [{fi+1}/{len(local_paths)}]: {path.name} — {num_groups} row group(s)", flush=True)
-
-            for rg in range(num_groups):
-                table = pf.read_row_group(rg)
-                rows = table.to_pylist()
-                del table
-
-                for row in rows:
-                    out.write(json.dumps(row) + "\n")
-                    written += 1
-
-                pct = int(written / total * 100)
-                print(f"\r  [{pct:3d}%] {written}/{total} rows written   ", end="", flush=True)
-
-    print(flush=True)
-    print(f"  ✓ Raw JSONL written to {raw_path}")
-
-# ─── Step 2: raw JSONL → masked JSONL ────────────────────────────────────────
-
-def render_turn(env, template_str, eos_token, bos_token, messages_slice, tools):
-    tmpl = env.from_string(template_str)
-    return tmpl.render(
-        messages=messages_slice,
-        tools=tools if tools else None,
-        eos_token=eos_token,
-        bos_token=bos_token,
-        add_generation_prompt=False,
-    )
-
-
-def convert_example(env, template_str, eos_token, bos_token, example):
-    messages = example.get("messages") or []
-    tools = example.get("tools") or None
-    results = []
-    previous_rendered = ""
-
-    for i, msg in enumerate(messages):
-        role = msg.get("role", "")
-        is_assistant = role in ("assistant", "model")
-        should_train = bool(msg.get("train_on_turn", False))
-
-        messages_slice = []
-        for m in messages[: i + 1]:
-            content = m.get("content", "")
-            if isinstance(content, list):
-                content = content[0].get("text", "") if content else ""
-            entry = {"role": m["role"], "content": content}
-            if m.get("tool_calls"):
-                entry["tool_calls"] = m["tool_calls"]
-            messages_slice.append(entry)
-
-        try:
-            current_rendered = render_turn(
-                env, template_str, eos_token, bos_token, messages_slice, tools
-            )
-        except Exception:
-            continue
-
-        turn_text = current_rendered[len(previous_rendered):]
-        previous_rendered = current_rendered
-
-        if turn_text and is_assistant and should_train:
-            prompt = previous_rendered[: len(previous_rendered) - len(turn_text)]
-            results.append({"text": prompt + turn_text})
-
-    return results
-
-
-def assign_split(idx: int, total: int) -> str:
-    r = idx / total
-    if r < 0.8:
-        return "train"
-    if r < 0.9:
-        return "valid"
-    return "test"
-
 
 def raw_jsonl_to_masked(
     dataset_hash: str,
     tokenizer_config: dict,
     tmpl_hash: str,
+    fmt_module,
 ) -> None:
-    raw_path = raw_jsonl_path(dataset_hash)
-    out_dir = template_cache_dir(dataset_hash, tmpl_hash)
-
-    template_str = tokenizer_config["chat_template"]
-    eos_token = get_token_string(tokenizer_config.get("eos_token"))
-    bos_token = get_token_string(tokenizer_config.get("bos_token"))
-
-    env = Environment(loader=BaseLoader(), keep_trailing_newline=True)
+    """Convert raw JSONL to masked training examples using the given format module.
+    Streams line by line to keep memory usage low.
+    Results are written to the template cache directory.
+    """
+    raw_path = raw_jsonl_path(CACHE_DIR, dataset_hash)
+    out_dir = template_cache_dir(CACHE_DIR, dataset_hash, tmpl_hash)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     total = count_jsonl_lines(raw_path)
@@ -415,6 +210,13 @@ def raw_jsonl_to_masked(
     counts = {"train": 0, "valid": 0, "test": 0}
     index = 0
 
+    def assign_split(idx: int, total: int) -> str:
+        """Assign an example to train/valid/test split by position ratio."""
+        r = idx / total
+        if r < 0.8: return "train"
+        if r < 0.9: return "valid"
+        return "test"
+
     with open(raw_path) as f:
         for line in f:
             line = line.strip()
@@ -426,12 +228,12 @@ def raw_jsonl_to_masked(
                 index += 1
                 continue
 
-            masked = convert_example(env, template_str, eos_token, bos_token, example)
+            masked = fmt_module.convert_for_training(example, tokenizer_config)
             split = assign_split(index, total)
             index += 1
 
             for item in masked:
-                writers[split].write(json.dumps(item) + "\n")
+                writers[split].write(json.dumps({"text": item.text}) + "\n")
                 counts[split] += 1
 
             if index % 1000 == 0:
@@ -441,8 +243,7 @@ def raw_jsonl_to_masked(
                     f"train: {counts['train']} "
                     f"valid: {counts['valid']} "
                     f"test: {counts['test']}   ",
-                    end="",
-                    flush=True,
+                    end="", flush=True,
                 )
 
     print(flush=True)
@@ -453,6 +254,7 @@ def raw_jsonl_to_masked(
 # ─── Run command ──────────────────────────────────────────────────────────────
 
 def run_command(cmd: list[str]) -> None:
+    """Run a subprocess command and raise RuntimeError if it fails."""
     print(f"\n$ {' '.join(cmd)}\n")
     result = subprocess.run(cmd)
     if result.returncode != 0:
@@ -465,6 +267,12 @@ def run_fine_tuning(
     out_data_dir: Path,
     adp_dir: Path,
 ) -> int:
+    """Run LoRA fine-tuning via mlx_lm with real-time early stopping.
+    Monitors validation loss from stdout and stops training when it has not
+    improved for --patience consecutive validations.
+    Saves best_iter.txt so --skip-train + fusion can find the best checkpoint.
+    Returns the best iter number.
+    """
     print("\n══════════════════════════════════════════")
     print("  Phase 1: LoRA Fine-tuning")
     print(f"  iters={LORA_CONFIG['iters']} batch={LORA_CONFIG['batch_size']} "
@@ -480,7 +288,7 @@ def run_fine_tuning(
     with open(lora_config_path, "w") as f:
         yaml.dump(LORA_YAML_CONFIG, f)
 
-    # Check for existing checkpoint to resume from
+    # Resume from last checkpoint if one exists
     checkpoints = sorted(adp_dir.glob("*_adapters.safetensors"))
     resume_args = []
     if checkpoints:
@@ -510,7 +318,6 @@ def run_fine_tuning(
     print(f"\n$ {' '.join(cmd)}\n")
 
     val_loss_re = re.compile(r"Iter (\d+): Val loss ([0-9.]+)")
-
     best_val_loss = float("inf")
     best_iter = 0
     no_improve_count = 0
@@ -527,12 +334,10 @@ def run_fine_tuning(
     try:
         for line in proc.stdout:
             print(line, end="", flush=True)
-
             m = val_loss_re.search(line)
             if m:
                 current_iter = int(m.group(1))
                 current_val_loss = float(m.group(2))
-
                 if current_val_loss < best_val_loss:
                     best_val_loss = current_val_loss
                     best_iter = current_iter
@@ -546,7 +351,6 @@ def run_fine_tuning(
                         proc.terminate()
                         proc.wait()
                         break
-
     except KeyboardInterrupt:
         print("\n  Interrupted — terminating process...")
         proc.terminate()
@@ -555,7 +359,7 @@ def run_fine_tuning(
     if proc.returncode not in (0, -15, None):
         raise RuntimeError(f"Fine-tuning failed with exit code {proc.returncode}")
 
-    # Save best iter for future use
+    # Persist best iter so --skip-train + fusion can find the right checkpoint
     best_iter_path = adp_dir / "best_iter.txt"
     best_iter_path.write_text(str(best_iter))
     print(f"  ✓ Best iter saved to {best_iter_path}")
@@ -570,6 +374,9 @@ def run_fuse(
     fused_path: Path,
     best_iter: int,
 ) -> None:
+    """Merge the best LoRA adapter into the base model using mlx_lm fuse.
+    Copies the best checkpoint to adapters.safetensors before fusing.
+    """
     print("\n══════════════════════════════════════════")
     print("  Phase 2: Adapter fusion")
     print("══════════════════════════════════════════")
@@ -605,18 +412,27 @@ def main():
 
     print(f"\n── Run {args.run_id} {'─' * 30}")
 
-    # 1. Compute cache keys
-    d_hash = short_hash(args.dataset)
-
-    # 2. Resolve model path and compute keys
+    # 1. Resolve model path and compute cache keys
     model_path = resolve_model_path(args.path)
     print(f"\n── Model ─────────────────────────────────")
     print(f"   {model_path}")
 
     tokenizer_config = read_tokenizer_config(model_path)
+    d_hash = short_hash(args.dataset)
     t_hash = short_hash(tokenizer_config["chat_template"])
 
+    # 2. Resolve dataset format — from CLI or cache
+    try:
+        dataset_format = resolve_dataset_format(
+            CACHE_DIR, d_hash, args.dataset_format
+        )
+        fmt_module = load_format(dataset_format)
+    except ValueError as e:
+        print(f"\n❌ {e}")
+        exit(1)
+
     print(f"   Dataset hash       : {d_hash}  ({args.dataset})")
+    print(f"   Dataset format     : {dataset_format}")
     print(f"   Template hash      : {t_hash}")
 
     fused_path = build_fused_path(model_path, args.fused_base, args.name)
@@ -624,20 +440,20 @@ def main():
 
     # 3. Download parquet files
     print(f"\n── Dataset ───────────────────────────────")
-    local_paths = download_parquet_files(args.dataset, d_hash)
+    local_paths = download_parquet_files(args.dataset, d_hash, CACHE_DIR)
 
-    # 4. Parquet → raw JSONL (cached per dataset)
-    parquet_to_raw_jsonl(d_hash, local_paths)
+    # 4. Parquet → raw JSONL (cached per dataset, format-independent)
+    parquet_to_raw_jsonl(CACHE_DIR, d_hash, local_paths)
 
     # 5. Raw JSONL → masked JSONL (cached per dataset + template)
     out_data_dir = data_dir(d_hash, t_hash)
 
-    if template_cache_valid(d_hash, t_hash):
+    if template_cache_valid(CACHE_DIR, d_hash, t_hash):
         print(f"✓ Template cache hit ({d_hash}_{t_hash}) — skipping conversion")
         copy_template_cache(d_hash, t_hash, out_data_dir)
     else:
-        print(f"\nApplying chat template (Jinja2)...")
-        raw_jsonl_to_masked(d_hash, tokenizer_config, t_hash)
+        print(f"\nApplying chat template (Jinja2) with format {dataset_format}...")
+        raw_jsonl_to_masked(d_hash, tokenizer_config, t_hash, fmt_module)
         copy_template_cache(d_hash, t_hash, out_data_dir)
 
     # 6. Fine-tuning
